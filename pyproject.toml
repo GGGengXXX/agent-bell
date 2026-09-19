@@ -1,6 +1,6 @@
 [project]
 name = "agent-bell"
-version = "0.1.0"
+version = "0.2.0"
 description = "A local completion notifier for Codex, agents, and terminal commands"
 readme = "docs/infra.md"
 requires-python = ">=3.9"

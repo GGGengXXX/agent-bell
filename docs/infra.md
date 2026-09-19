@@ -127,14 +127,14 @@ abll run -- npm test
 
 ## 6. Codex 接入
 
-Codex 原生提供 `notify` hook，因此不需要轮询 Codex 进程，也不需要修改 Codex 本身。安装命令执行以下步骤：
+Codex 原生提供 `notify` hook，因此不需要轮询 Codex 进程，也不需要修改 Codex 本身。`agent-bell codex setup` 执行以下步骤：
 
 1. 检查 `agent-bell daemon` 是否运行，未运行则安装并启动用户级服务。
 2. 生成或复用本机 token。
-3. 写入 Codex 的 `notify` 配置，使其调用 `agent-bell codex-hook`。
+3. 写入 Codex 的 `notify` 配置，使其调用 `agent-bell codex-hook`；如果已有其他 `notify`，默认保留并提示冲突。
 4. `codex-hook` 从 stdin 或环境变量读取 hook payload，提取完成状态和摘要。
 5. 转换为 `source=codex` 事件并发送到本机 `/v1/events`。
-6. 提供 `agent-bell codex setup --check` 验证配置，并用一条测试事件确认弹窗可见。
+6. 提供 `agent-bell codex setup --check` 只读验证配置；需要覆盖已有配置时使用 `--force`，旧配置会先备份。
 
 Hook 适配器需要容忍字段变化：不能把某一个 Codex payload 的完整结构写死为公共协议。原始 payload 仅用于 `metadata`，并限制大小。
 
@@ -170,6 +170,14 @@ abll ssh connect --ssh-port 6269 root@114.111.28.42
 ```
 
 `ssh setup` 会通过 SSH 在远端创建 `~/.config/agent-bell/token` 和配置文件，并复制本机事件 token。`ssh connect` 在后台运行带 `ExitOnForwardFailure=yes` 的反向隧道，将远端 `127.0.0.1:18765` 映射到本机 Daemon。连接建立后，远端只要安装 Agent Bell，就可以执行：
+
+也可以使用一条命令完成上述步骤：
+
+```bash
+abll ssh configure user@remote-host
+```
+
+该命令将每个步骤写入本机 state 目录的 checkpoint 文件。SSH 配置失败会有限次退避重试，重新执行命令会跳过已完成的配置步骤；隧道由监督进程运行，连接断开后会自动重连。
 
 ```bash
 abll run -- pytest -q

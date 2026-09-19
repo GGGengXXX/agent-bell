@@ -22,7 +22,7 @@ def load(path: Path) -> dict:
                 values[key.upper()] = value.strip('"\'')
     host, port = values.get("HOST", "127.0.0.1"), int(values.get("PORT", "18765"))
     return {
-        "host": host, "port": port,
+        "host": host, "host_ip": values.get("HOST_IP") or None, "port": port,
         "db": Path(os.path.expanduser(values.get("DB", str(DEFAULT_DB)))),
         "token_file": Path(os.path.expanduser(values.get("TOKEN_FILE", str(DEFAULT_TOKEN)))),
         "sound": values.get("SOUND", "true").lower() not in {"0", "false", "no"},

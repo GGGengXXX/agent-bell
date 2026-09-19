@@ -41,9 +41,16 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     length = min(int(self.headers.get("Content-Length", "0")), 65536); payload = json.loads(self.rfile.read(length))
                     if not payload.get("event_id") or not payload.get("source"): raise ValueError("event_id and source are required")
+                    # The sender's host tells us whether this arrived through
+                    # an SSH tunnel or was created on this machine.
+                    payload = dict(payload)
+                    payload["origin"] = "local" if payload.get("host") == os.uname().nodename else "remote"
                 except (ValueError, json.JSONDecodeError) as exc:
                     self.reply(400, {"error": str(exc)}); return
         else: self.reply(404, {"error": "not_found"}); return
+        if "origin" not in payload:
+            payload = dict(payload)
+            payload["origin"] = "local" if payload.get("host") == os.uname().nodename else "remote"
         inserted = self.store.add(payload); self.worker.wakeup.set(); self.reply(202 if inserted else 200, {"accepted": True, "event_id": payload["event_id"]})
 
     def log_message(self, *_): pass
