@@ -124,7 +124,11 @@ def connect(config: dict, host: str, local_port: int, remote_port: int, ssh_args
         command += ["-p", str(ssh_port)]
     command += ["-N", "-T", "-o", "ExitOnForwardFailure=yes",
                "-o", "ServerAliveInterval=30", "-o", "ServerAliveCountMax=3",
-               "-R", f"{remote_port}:127.0.0.1:{local_port}"] + ssh_args + [host]
+               # Bind the reverse-forward endpoint explicitly on IPv4.  On
+               # hosts whose sshd defaults to IPv6 loopback, an unqualified
+               # -R 18765:... only listens on ::1 while remote senders use
+               # http://127.0.0.1:18765.
+               "-R", f"127.0.0.1:{remote_port}:127.0.0.1:{local_port}"] + ssh_args + [host]
     # Keep a small supervisor around the SSH client.  A dropped connection is
     # retried with backoff, while the pid still represents one manageable job.
     ssh_command = shlex.join(command)

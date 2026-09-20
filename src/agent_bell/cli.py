@@ -16,6 +16,8 @@ import termios
 import tty
 import time
 import unicodedata
+import tempfile
+import re
 from pathlib import Path
 
 from . import daemon
@@ -61,13 +63,89 @@ def _codex_config_path() -> Path:
     return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))).expanduser() / "config.toml"
 
 
-def _notify_line(path: Path) -> tuple[int, str] | None:
+_NOTIFY_KEY = re.compile(r'^(\s*)(?:notify|"notify"|\'notify\')\s*=')
+
+
+def _notify_entries(path: Path) -> list[dict]:
+    """Locate complete notify assignments without mistaking strings for tables."""
     if not path.exists():
-        return None
-    for number, raw in enumerate(path.read_text().splitlines(), 1):
-        if raw.lstrip().startswith("notify") and "=" in raw:
-            return number, raw
-    return None
+        return []
+    lines = path.read_text().splitlines()
+    entries = []
+    table = False
+    triple = None
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if triple:
+            if triple in line:
+                triple = None
+            index += 1
+            continue
+        # A table header is meaningful only outside a multiline string.
+        if line.lstrip().startswith("["):
+            table = True
+        match = _NOTIFY_KEY.match(line)
+        if not match:
+            if '"""' in line or "'''" in line:
+                token = '"""' if '"""' in line else "'''"
+                if line.count(token) % 2:
+                    triple = token
+            index += 1
+            continue
+        start = index
+        depth = 0
+        quote = None
+        cursor = index
+        while cursor < len(lines):
+            value = lines[cursor][lines[cursor].find("=") + 1:] if cursor == start else lines[cursor]
+            escaped = False
+            pos = 0
+            while pos < len(value):
+                char = value[pos]
+                if quote:
+                    if char == quote and not escaped:
+                        quote = None
+                    escaped = (char == "\\" and not escaped)
+                elif char in "\"'":
+                    quote = char
+                    escaped = False
+                elif char in "[({":
+                    depth += 1
+                elif char in "])":
+                    depth = max(0, depth - 1)
+                pos += 1
+            if depth == 0 and quote is None:
+                break
+            cursor += 1
+        end = min(cursor, len(lines) - 1)
+        text = "\n".join(lines[start:end + 1])
+        entries.append({"start": start, "end": end, "line": start + 1,
+                        "text": text, "top_level": not table})
+        index = end + 1
+    return entries
+
+
+def _notify_line(path: Path) -> tuple[int, str] | None:
+    entry = next((item for item in _notify_entries(path) if item["top_level"]), None)
+    return (entry["line"], entry["text"]) if entry else None
+
+
+def _first_table_line(lines: list[str]) -> int:
+    """Return the first real TOML table header, ignoring multiline strings."""
+    triple = None
+    for number, line in enumerate(lines):
+        if triple:
+            if triple in line and line.count(triple) % 2:
+                triple = None
+            continue
+        if line.lstrip().startswith("["):
+            return number
+        for token in ('"""', "'''"):
+            if token in line and line.count(token) % 2:
+                triple = token
+                break
+    return len(lines)
 
 
 def _notify_is_agent_bell(line: str) -> bool:
@@ -99,29 +177,54 @@ def codex_setup(config: dict, config_path: Path, check: bool = False, force: boo
     """Install Agent Bell's Codex notify command without clobbering user hooks."""
     codex_config = _codex_config_path()
     current = _notify_line(codex_config)
+    entries = _notify_entries(codex_config)
     command = _agent_bell_command()
     rendered = "notify = " + json.dumps(command, ensure_ascii=False)
 
-    if current and _notify_is_agent_bell(current[1]):
-        print(f"Codex Agent Bell is already configured ({codex_config}:{current[0]}).")
-    elif current and not force:
+    foreign_entries = [entry for entry in entries if entry["top_level"] and not _notify_is_agent_bell(entry["text"])]
+    if current and not _notify_is_agent_bell(current[1]) and not force:
         print(f"Codex already has a notify command ({codex_config}:{current[0]}):")
         print(f"  {current[1].strip()}")
+        print("Refusing to replace it. Use --force to back it up and install Agent Bell.", file=sys.stderr)
+        return 2
+    elif foreign_entries and not force:
+        entry = foreign_entries[0]
+        print(f"Codex already has a notify command ({codex_config}:{entry['line']}):")
+        print(f"  {entry['text'].strip()}")
         print("Refusing to replace it. Use --force to back it up and install Agent Bell.", file=sys.stderr)
         return 2
     elif not check:
         codex_config.parent.mkdir(parents=True, exist_ok=True)
         lines = codex_config.read_text().splitlines() if codex_config.exists() else []
-        if current:
+        if entries:
             backup = codex_config.with_name(codex_config.name + ".agent-bell.bak")
             shutil.copy2(codex_config, backup)
-            lines[current[0] - 1] = rendered
             print(f"Backed up existing Codex config to {backup}")
-        else:
-            if lines and lines[-1].strip():
-                lines.append("")
-            lines.append(rendered)
-        codex_config.write_text("\n".join(lines) + "\n")
+        # Remove stale Agent Bell assignments, including ones nested under a
+        # TOML table, then insert exactly one top-level notify key.
+        remove = [(entry["start"], entry["end"]) for entry in entries
+                  if _notify_is_agent_bell(entry["text"]) or (force and entry["top_level"])]
+        lines = [line for number, line in enumerate(lines)
+                 if not any(start <= number <= end for start, end in remove)]
+        insert_at = _first_table_line(lines)
+        if insert_at and lines[insert_at - 1].strip():
+            lines.insert(insert_at, "")
+            insert_at += 1
+        lines.insert(insert_at, rendered)
+        rendered_text = "\n".join(lines) + "\n"
+        try:
+            import tomllib
+            tomllib.loads(rendered_text)
+        except Exception as exc:
+            raise RuntimeError(f"Refusing to write invalid TOML: {exc}") from exc
+        mode = codex_config.stat().st_mode & 0o777 if codex_config.exists() else 0o600
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=codex_config.parent,
+                                         prefix=".config.toml.", delete=False) as temporary:
+            temporary.write(rendered_text)
+            temporary.flush(); os.fsync(temporary.fileno())
+            temporary_path = Path(temporary.name)
+        os.chmod(temporary_path, mode)
+        os.replace(temporary_path, codex_config)
         print(f"Configured Codex notify in {codex_config}")
     else:
         print(f"Codex notify would be set to: {rendered}")
@@ -173,6 +276,30 @@ def _fit(value: object, width: int) -> str:
             break
         result += char
     return result + "…"
+
+
+def _pad(value: object, width: int, align: str = "left") -> str:
+    """Pad terminal text using display width, so CJK values stay aligned."""
+    text = _fit(value, width)
+    gap = max(0, width - _display_width(text))
+    return (" " * gap + text) if align == "right" else (text + " " * gap)
+
+
+def _ansi(text: object, code: str) -> str:
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _queue_widths(total: int) -> tuple[int, int, int, int, int, int]:
+    """Return adaptive widths for the compact queue columns."""
+    # # / endpoint / thread / project / message. Keep the important content
+    # readable on a narrow laptop terminal, while letting messages breathe.
+    available = max(24, total - 4 - 14 - 12 - 8 - 11 - 3 * 4)
+    origin = 14
+    thread = max(12, min(24, int(available * .18)))
+    project = max(10, min(20, int(available * .14)))
+    endpoint = max(12, min(18, int(available * .14)))
+    message = max(16, available - thread - project - endpoint)
+    return 3, origin, endpoint, thread, project, message
 
 
 def _event_thread_name(payload: dict) -> str:
@@ -262,37 +389,48 @@ def _queue_render(store: EventStore, config: dict, selected: int, detail: bool, 
         selected = min(selected, len(items) - 1)
     else:
         selected = 0
-    print("\033[2J\033[H", end="")
-    print(_queue_line("  █████╗  ██████╗ ██╗     ██╗     ", "\033[96m"))
-    print(_queue_line(" ██╔══██╗██╔═══██╗██║     ██║     ", "\033[96m"))
-    print(_queue_line(" ███████║██║   ██║██║     ██║     ", "\033[95m"))
-    print(_queue_line(" ██╔══██║██║   ██║██║     ██║     ", "\033[95m"))
-    print(_queue_line(" ██║  ██║╚██████╔╝███████╗███████╗", "\033[96m"))
-    print(_queue_line(" ╚═╝  ╚═╝ ╚═════╝ ╚══════╝╚══════╝", "\033[96m"))
+    width = shutil.get_terminal_size((100, 32)).columns
+    inner = max(40, min(width - 4, 132))
     unread = sum(item["read_at"] is None for item in items)
-    heading = _queue_line("MESSAGE QUEUE", "\033[1;97m")
-    print(f"\n  {heading}  {len(items)} messages · {unread} unread")
-    print("  " + "─" * 130)
+    print("\033[2J\033[H", end="")
+    print()
+    print("  " + _ansi("AB", "1;30;46") + "  " + _ansi("AGENT BELL", "1;97") + "  " + _ansi("/", "90") + "  " + _ansi("MESSAGE INBOX", "36"))
+    sync = _ansi("● LIVE", "1;92") if not unread_only else _ansi("◌ UNREAD FILTER", "1;93")
+    print("  " + _ansi(f"{len(items):02d}", "1;96") + " messages   " + _ansi(f"{unread:02d}", "1;93") + " unread   " + sync)
+    print("  " + _ansi("─" * inner, "90"))
     if not items:
-        print("\n  Queue is empty. Completed responses will appear here automatically.")
+        print("\n  " + _ansi("      ◌", "36") + "  Queue is empty")
+        print("     Completed responses will appear here automatically.")
     else:
-        print("  # | SRC    | REMOTE IP       | TYPE    | THREAD NAME       | PROJECT DIR       | CONTENT")
+        number_w, origin_w, endpoint_w, thread_w, project_w, message_w = _queue_widths(inner)
+        print("  " + _ansi(
+            f"{_pad('#', number_w, 'right')}   {_pad('ORIGIN / TYPE', origin_w)}   {_pad('ENDPOINT', endpoint_w)}   "
+            f"{_pad('THREAD', thread_w)}   {_pad('PROJECT', project_w)}   {_pad('MESSAGE', message_w)}", "90"))
+        print("  " + _ansi("─" * inner, "90"))
         for index, item in enumerate(items):
             payload = item["payload"]; marker = "*" if item["read_at"] is None else " "
-            color = "\033[1;97m" if index == selected else ("\033[93m" if item["read_at"] is None else "\033[90m")
             state = payload.get("status", item["status"]).upper()
             source = payload.get("source", "unknown")
             origin = payload.get("origin") or ("local" if payload.get("host") == os.uname().nodename else "remote")
             origin = "LOCAL" if origin == "local" else "REMOTE"
-            thread = _fit(_event_thread_name(payload), 17)
-            project = _fit(_event_project_dir(payload), 18)
-            message = _fit(payload.get("message", "(no message)"), 32)
-            line = f" {marker}{index + 1:>2} | {_fit(origin, 6):<6} | {_fit(_event_ip(payload, config), 15):<15} | {_fit(source, 7):<7} | {thread:<17} | {project:<18} | {message}"
-            print(_queue_line(line, color))
+            endpoint = _event_ip(payload, config)
+            origin_type = f"{origin} · {str(source).upper()}"
+            thread = _event_thread_name(payload)
+            project = _event_project_dir(payload)
+            message = payload.get("message", "(no message)")
+            badge = "✓" if state == "SUCCESS" else ("×" if state in {"FAILURE", "CANCELLED"} else "·")
+            row = (f"{_pad(marker + str(index + 1), number_w, 'right')}   "
+                   f"{_pad(origin_type, origin_w)}   {_pad(endpoint, endpoint_w)}   "
+                   f"{_pad(thread, thread_w)}   {_pad(project, project_w)}   {_pad(message, message_w)}")
+            if index == selected:
+                print("  " + _ansi("▌ " + row, "1;97;46"))
+            elif item["read_at"] is None:
+                print("  " + _ansi("  " + row, "93") + "  " + _ansi(badge, "1;93"))
+            else:
+                print("  " + _ansi("  " + row, "37") + "  " + _ansi(badge, "90"))
         if detail:
             item = items[selected]; payload = item["payload"]
-            print("\n  " + "─" * 72)
-            print(_queue_line(f"  DETAILS · {selected + 1}/{len(items)}", "\033[1;96m"))
+            print("\n  " + _ansi("┌─ DETAILS " + f"· {selected + 1}/{len(items)} " + "─" * max(0, inner - 18), "36"))
             fields = [("message", payload.get("message", "")), ("source", payload.get("source", "")),
                       ("thread", _event_thread_name(payload)), ("project dir", _event_project_path(payload)),
                       ("remote ip", _event_ip(payload, config)),
@@ -302,10 +440,10 @@ def _queue_render(store: EventStore, config: dict, selected: int, detail: bool, 
                           if key not in {"event_id", "message", "source", "status", "finished_at", "metadata"})
             for key, value in fields:
                 value = str(value).replace("\n", " ")
-                print(textwrap.fill(f"  {key:<10} {value}", width=78, subsequent_indent="  "))
+                print(textwrap.fill(f"  {_pad(key, 10)} {value}", width=inner, subsequent_indent="  "))
             metadata = payload.get("metadata")
             if metadata: print(textwrap.indent(json.dumps(metadata, ensure_ascii=False, indent=2), "  "))
-    print("\n  ↑/↓ or j/k select   Enter/d details   r read   u unread   a all read   n next unread   q quit")
+    print("\n  " + _ansi("↑/↓ j/k", "1;97") + " select   " + _ansi("Enter/d", "1;97") + " details   " + _ansi("r/u", "1;97") + " read   " + _ansi("a", "1;97") + " all read   " + _ansi("n", "1;97") + " next unread   " + _ansi("q", "1;97") + " quit")
     return items, selected
 
 
